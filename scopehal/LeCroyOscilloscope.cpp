@@ -269,6 +269,14 @@ void LeCroyOscilloscope::IdentifyHardware()
 		m_modelid = MODEL_WAVESURFER_3K;
 		m_maxBandwidth = stoi(m_model.substr(3, 2)) * 100;
 	}
+	else if(m_model.find("WR6") == 0)
+	{
+		if (m_model.find("ZI") != string::npos) 
+		{
+			m_modelid = MODEL_WAVERUNNER_6ZI;
+			m_maxBandwidth = stoi(m_model.substr(3, 2)) * 100;
+		}
+	}
 	else
 	{
 		LogWarning("Model \"%s\" is unknown, available sample rates/memory depths may not be properly detected\n",
@@ -935,6 +943,11 @@ void LeCroyOscilloscope::DetectAnalogChannels()
 			nchans = 8;
 			break;
 
+		//Waverunner 6Zi all have 4 channels
+		case MODEL_WAVERUNNER_6ZI:
+			nchans = 4;
+			break;
+
 		//LabMaster MCM could have any number of channels.
 		//This is ugly and produces errors in the remote log each time we start up, but does work.
 		case MODEL_LABMASTER_ZI_A:
@@ -1295,6 +1308,7 @@ bool LeCroyOscilloscope::CanEnableChannel(size_t i)
 		case MODEL_HDO_9K:
 		case MODEL_SDA_3K:
 		case MODEL_HDO_4KA:
+		case MODEL_WAVERUNNER_6ZI:
 		case MODEL_WAVERUNNER_8K:
 		case MODEL_WAVERUNNER_8K_HD:		//TODO: seems like multiple levels of interleaving possible
 		case MODEL_SDA_7ZI:
@@ -1593,6 +1607,11 @@ vector<unsigned int> LeCroyOscilloscope::GetChannelBandwidthLimiters(size_t /*i*
 			ret.clear();
 			if(m_maxBandwidth >= 350)
 				ret.push_back(200);
+			break;
+
+		case MODEL_WAVERUNNER_6ZI:
+			if(m_maxBandwidth >= 2000)
+				ret.push_back(1000);
 			break;
 
 		//Only the default 20/200
@@ -3175,7 +3194,7 @@ vector<uint64_t> LeCroyOscilloscope::GetSampleRatesNonInterleaved()
 	{
 		//Not all scopes can go this slow
 		//TODO: complete list
-		if(m_modelid == MODEL_WAVERUNNER_8K)
+		if(m_modelid == MODEL_WAVERUNNER_8K || m_modelid == MODEL_WAVERUNNER_6ZI)
 			ret.push_back(1000);
 
 		bool wm7 =
@@ -3188,30 +3207,37 @@ vector<uint64_t> LeCroyOscilloscope::GetSampleRatesNonInterleaved()
 			(m_modelid == MODEL_SDA_8ZI_B);
 		bool hdo9 = (m_modelid == MODEL_HDO_9K);
 		bool wr8 = (m_modelid == MODEL_WAVERUNNER_8K);
+		bool wr6zi = (m_modelid == MODEL_WAVERUNNER_6ZI);
 
 		//WaveMaster 8Zi can't go below 200 ksps in realtime mode?
 		if(!wm8)
 		{
-			ret.push_back(2 * k);
+			if(wr6zi)
+				ret.push_back(2500);
+			else
+				ret.push_back(2 * k);
 			ret.push_back(5 * k);
 			ret.push_back(10 * k);
-			ret.push_back(20 * k);
+			if(wr6zi)
+				ret.push_back(25000);
+			else
+				ret.push_back(20 * k);
 			ret.push_back(50 * k);
 			ret.push_back(100 * k);
 		}
 		ret.push_back(200 * k);
-		if(wm8)
+		if(wm8 || wr6zi)
 			ret.push_back(250 * k);
 		ret.push_back(500 * k);
 
 		ret.push_back(1 * m);
-		if(hdo9 || wm8 || wr8)
+		if(hdo9 || wm8 || wr8 || wr6zi)
 			ret.push_back(2500 * k);
 		else
 			ret.push_back(2 * m);
 		ret.push_back(5 * m);
 		ret.push_back(10 * m);
-		if(wm8 || wm7)
+		if(wm8 || wm7 || wr6zi)
 			ret.push_back(25 * m);
 		else
 			ret.push_back(20 * m);
@@ -3282,6 +3308,18 @@ vector<uint64_t> LeCroyOscilloscope::GetSampleRatesNonInterleaved()
 				ret.push_back(10 * g);
 				break;
 
+			case MODEL_WAVERUNNER_6ZI:
+				ret.push_back(200 * m);
+				ret.push_back(500 * m);
+				ret.push_back(1 * g);
+				ret.push_back(2 * g);
+				ret.push_back(5 * g);
+				ret.push_back(10 * g);
+
+				if(m_maxBandwidth > 2000)
+					ret.push_back(20 * g);
+				break;
+
 			case MODEL_SDA_7ZI:
 			case MODEL_SDA_7ZI_A:
 				ret.push_back(250 * m);
@@ -3292,7 +3330,7 @@ vector<uint64_t> LeCroyOscilloscope::GetSampleRatesNonInterleaved()
 				ret.push_back(10 * g);
 
 				//2.5 GHz and higher SKUs have double the ADCs
-				if(m_maxBandwidth > 2000)
+				if(m_maxBandwidth > 2000 || m_hasFastSampleRate)
 					ret.push_back(20 * g);
 				break;
 
@@ -3485,6 +3523,7 @@ vector<uint64_t> LeCroyOscilloscope::GetSampleDepthsNonInterleaved()
 				break;
 
 			//TODO: extended memory options
+			case MODEL_WAVERUNNER_6ZI:
 			case MODEL_SDA_7ZI:
 			case MODEL_SDA_7ZI_A:
 				ret.push_back(20 * m);
