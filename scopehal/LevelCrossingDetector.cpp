@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -130,7 +130,7 @@ int64_t LevelCrossingDetector::FindZeroCrossings(
 
 	m_preGatherPipeline->BindBufferNonblocking(0, m_gatherIndexes, cmdBuf, true);
 	m_preGatherPipeline->BindBufferNonblocking(1, m_temporaryResults, cmdBuf);
-	m_preGatherPipeline->Dispatch(cmdBuf, ppush, numThreads+1, 1);
+	m_preGatherPipeline->Dispatch(cmdBuf, ppush, GetComputeBlockCount(numThreads+1, 64), 1);
 
 	m_gatherIndexes.MarkModifiedFromGpu();
 	m_preGatherPipeline->AddComputeMemoryBarrier(cmdBuf);
@@ -144,14 +144,18 @@ int64_t LevelCrossingDetector::FindZeroCrossings(
 	m_gatherPipeline->BindBufferNonblocking(0, m_outbuf, cmdBuf, true);
 	m_gatherPipeline->BindBufferNonblocking(1, m_temporaryResults, cmdBuf);
 	m_gatherPipeline->BindBufferNonblocking(2, m_gatherIndexes, cmdBuf);
-	m_gatherPipeline->Dispatch(cmdBuf, gpush, numThreads, 1);
+	m_gatherPipeline->Dispatch(cmdBuf, gpush, GetComputeBlockCount(numThreads, 64), 1);
 
 	m_outbuf.MarkModifiedFromGpu();
+
+	m_gatherIndexes.PrepareForCpuAccessNonblocking(cmdBuf);
 
 	cmdBuf.end();
 	queue->SubmitAndBlock(cmdBuf);
 
-	//Grab the length off the GPU immediately
-	m_gatherIndexes.PrepareForCpuAccess();
-	return m_gatherIndexes[numThreads];
+	//Grab the length off the GPU immediately then resize the buffer so we can use normal iterators on it
+	//m_gatherIndexes.PrepareForCpuAccess();
+	auto len = m_gatherIndexes[numThreads];
+	m_outbuf.resize(len);
+	return len;
 }

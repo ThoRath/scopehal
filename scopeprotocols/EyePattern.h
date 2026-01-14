@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopeprotocols                                                                                                    *
 *                                                                                                                      *
-* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -39,6 +39,34 @@
 #include "EyeMask.h"
 #include "../scopehal/EyeWaveform.h"
 
+class EyeIndexConstants
+{
+public:
+	int64_t		timescale;
+	int64_t		triggerPhase;
+	uint32_t	len;
+	uint32_t	numSamplesPerThread;
+};
+
+class EyeFilterConstants
+{
+public:
+	uint64_t	width;
+	uint64_t	halfwidth;
+	int64_t		timescale;
+	int64_t		triggerPhase;
+	int64_t		xoff;
+	uint32_t	wend;
+	uint32_t	cend;
+	uint32_t	xmax;
+	uint32_t	ymax;
+	uint32_t	mwidth;
+	float		xtimescale;
+	float		yscale;
+	float		yoff;
+	float		xscale;
+};
+
 class EyePattern : public Filter
 {
 public:
@@ -49,6 +77,7 @@ public:
 	static std::string GetProtocolName();
 
 	virtual bool ValidateChannel(size_t i, StreamDescriptor stream) override;
+	virtual DataLocation GetInputLocation() override;
 
 	virtual float GetVoltageRange(size_t stream) override;
 	virtual float GetOffset(size_t stream) override;
@@ -120,11 +149,10 @@ public:
 protected:
 	void DoMaskTest(EyeWaveform* cap);
 
-	void RecalculateUIWidth(std::vector<int64_t>& clock_edges, EyeWaveform* cap);
+	void RecalculateUIWidth(EyeWaveform* cap);
 
 	void SparsePackedInnerLoop(
 		SparseAnalogWaveform* waveform,
-		std::vector<int64_t>& clock_edges,
 		int64_t* data,
 		size_t wend,
 		size_t cend,
@@ -137,8 +165,21 @@ protected:
 
 	void DensePackedInnerLoop(
 		UniformAnalogWaveform* waveform,
-		std::vector<int64_t>& clock_edges,
 		int64_t* data,
+		size_t wend,
+		size_t cend,
+		int32_t xmax,
+		int32_t ymax,
+		float xtimescale,
+		float yscale,
+		float yoff
+		);
+
+	void DensePackedInnerLoopGPU(
+		vk::raii::CommandBuffer& cmdBuf,
+		std::shared_ptr<QueueHandle> queue,
+		UniformAnalogWaveform* waveform,
+		AcceleratorBuffer<int64_t>& data,
 		size_t wend,
 		size_t cend,
 		int32_t xmax,
@@ -151,7 +192,6 @@ protected:
 #ifdef __x86_64__
 	void DensePackedInnerLoopAVX2(
 		UniformAnalogWaveform* waveform,
-		std::vector<int64_t>& clock_edges,
 		int64_t* data,
 		size_t wend,
 		size_t cend,
@@ -164,7 +204,6 @@ protected:
 
 	void DensePackedInnerLoopAVX2FMA(
 		UniformAnalogWaveform* waveform,
-		std::vector<int64_t>& clock_edges,
 		int64_t* data,
 		size_t wend,
 		size_t cend,
@@ -177,7 +216,6 @@ protected:
 
 	void DensePackedInnerLoopAVX512F(
 		UniformAnalogWaveform* waveform,
-		std::vector<int64_t>& clock_edges,
 		int64_t* data,
 		size_t wend,
 		size_t cend,
@@ -205,8 +243,20 @@ protected:
 	std::string m_clockAlignName;
 	std::string m_rateModeName;
 	std::string m_rateName;
+	std::string m_numLevelsName;
 
 	EyeMask m_mask;
+
+	AcceleratorBuffer<int64_t> m_clockEdges;
+	AcceleratorBuffer<uint32_t> m_indexBuffer;
+
+	AcceleratorBuffer<int64_t>* m_clockEdgesMuxed;
+	AcceleratorBuffer<int64_t> m_normalizeMaxBuf;
+
+	std::shared_ptr<ComputePipeline> m_eyeComputePipeline;
+	std::shared_ptr<ComputePipeline> m_eyeNormalizeReduceComputePipeline;
+	std::shared_ptr<ComputePipeline> m_eyeNormalizeScaleComputePipeline;
+	std::shared_ptr<ComputePipeline> m_eyeIndexSearchPipeline;
 };
 
 #endif

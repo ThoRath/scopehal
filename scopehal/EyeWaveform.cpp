@@ -1,8 +1,8 @@
 /***********************************************************************************************************************
 *                                                                                                                      *
-* libscopehal                                                                                                    *
+* libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2024 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -57,22 +57,26 @@ EyeWaveform::EyeWaveform(size_t width, size_t height, float center, EyeType etyp
 	: DensityFunctionWaveform(width, height)
 	, m_uiWidth(0)
 	, m_saturationLevel(1)
+	, m_numLevels(2)
 	, m_totalUIs(0)
 	, m_totalSamples(0)
 	, m_centerVoltage(center)
 	, m_maskHitRate(0)
 	, m_type(etype)
 {
+	m_accumdata.SetCpuAccessHint(AcceleratorBuffer<int64_t>::HINT_LIKELY);
+	m_accumdata.SetGpuAccessHint(AcceleratorBuffer<int64_t>::HINT_LIKELY);
+
 	size_t npix = width*height;
-	m_accumdata = new int64_t[npix];
+	m_accumdata.resize(npix);
+	m_accumdata.PrepareForCpuAccess();
 	for(size_t i=0; i<npix; i++)
 		m_accumdata[i] = 0;
+	m_accumdata.MarkModifiedFromCpu();
 }
 
 EyeWaveform::~EyeWaveform()
 {
-	delete[] m_accumdata;
-	m_accumdata = NULL;
 }
 
 /**
@@ -80,13 +84,16 @@ EyeWaveform::~EyeWaveform()
  */
 void EyeWaveform::Normalize()
 {
+	m_accumdata.PrepareForCpuAccess();
+
 	//Preprocessing
 	int64_t nmax = 0;
 	int64_t halfwidth = m_width/2;
 	size_t blocksize = halfwidth * sizeof(int64_t);
+	auto ptr = m_accumdata.GetCpuPointer();
 	for(size_t y=0; y<m_height; y++)
 	{
-		int64_t* row = m_accumdata + y*m_width;
+		int64_t* row = ptr + y*m_width;
 
 		//Find peak amplitude
 		for(size_t x=halfwidth; x<m_width; x++)
@@ -99,16 +106,50 @@ void EyeWaveform::Normalize()
 		nmax = 1;
 	float norm = 2.0f / nmax;
 
-	/*
-		Normalize with saturation
-		TODO: do this in a shader?
-	 */
+	//Normalize with saturation
 	norm *= m_saturationLevel;
 	size_t len = m_width * m_height;
 	m_outdata.PrepareForCpuAccess();
 	for(size_t i=0; i<len; i++)
 		m_outdata[i] = min(1.0f, m_accumdata[i] * norm);
 	m_outdata.MarkModifiedFromCpu();
+}
+
+void EyeWaveform::Normalize(
+	vk::raii::CommandBuffer& cmdBuf,
+	shared_ptr<QueueHandle> queue,
+	shared_ptr<ComputePipeline> normalizeReducePipe,
+	shared_ptr<ComputePipeline> normalizeScalePipe,
+	AcceleratorBuffer<int64_t>& nmaxBuf)
+{
+	//GPU reduction
+	const uint32_t threadsPerBlock = 64;
+	cmdBuf.begin({});
+
+	EyeNormalizeConstants cfg;
+	cfg.width = m_width;
+	cfg.height = m_height;
+	cfg.satLevel = m_saturationLevel;
+
+	//First pass: find maximum and copy right half to left half
+	normalizeReducePipe->BindBufferNonblocking(0, m_accumdata, cmdBuf);
+	normalizeReducePipe->BindBufferNonblocking(1, nmaxBuf, cmdBuf);
+	normalizeReducePipe->Dispatch(cmdBuf, cfg, GetComputeBlockCount(m_height, threadsPerBlock));
+	normalizeReducePipe->AddComputeMemoryBarrier(cmdBuf);
+
+	nmaxBuf.MarkModifiedFromGpu();
+	m_accumdata.MarkModifiedFromGpu();
+
+	//Second pass: actually normalize
+	normalizeScalePipe->BindBufferNonblocking(0, m_accumdata, cmdBuf);
+	normalizeScalePipe->BindBufferNonblocking(1, nmaxBuf, cmdBuf);
+	normalizeScalePipe->BindBufferNonblocking(2, m_outdata, cmdBuf);
+	normalizeScalePipe->Dispatch(cmdBuf, cfg, GetComputeBlockCount(m_height, threadsPerBlock));
+
+	m_outdata.MarkModifiedFromGpu();
+
+	cmdBuf.end();
+	queue->SubmitAndBlock(cmdBuf);
 }
 
 /**
@@ -127,6 +168,8 @@ void EyeWaveform::Normalize()
  */
 double EyeWaveform::GetBERAtPoint(ssize_t pointx, ssize_t pointy, ssize_t xmid, ssize_t ymid)
 {
+	m_accumdata.PrepareForCpuAccess();
+
 	if(m_type == EYE_BER)
 	{
 		//out of bounds? all error

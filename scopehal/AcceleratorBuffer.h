@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -497,14 +497,26 @@ public:
 	}
 
 	/**
+		@brief Copies our content from a std::vector
+	 */
+	 __attribute__((noinline))
+	 void CopyFrom(const std::vector<T>& rhs)
+	 {
+		 PrepareForCpuAccess();
+		 resize(rhs.size());
+		 memcpy(m_cpuPtr, &rhs[0], m_size * sizeof(T));
+		 MarkModifiedFromCpu();
+	 }
+
+	/**
 		@brief Copies our content from another AcceleratorBuffer
 	 */
 	 __attribute__((noinline))
-	void CopyFrom(const AcceleratorBuffer<T>& rhs)
+	void CopyFrom(const AcceleratorBuffer<T>& rhs, bool reallocateToMatch = true)
 	{
 		//Copy placement hints from the other instance, then resize to match
 		SetCpuAccessHint(rhs.m_cpuAccessHint);
-		SetGpuAccessHint(rhs.m_gpuAccessHint, true);
+		SetGpuAccessHint(rhs.m_gpuAccessHint, reallocateToMatch);
 		resize(rhs.m_size);
 
 		//Valid data CPU side? Copy it to here
@@ -536,6 +548,46 @@ public:
 
 			//Submit the request and block until it completes
 			g_vkTransferQueue->SubmitAndBlock(*g_vkTransferCommandBuffer);
+		}
+		m_gpuPhysMemIsStale = rhs.m_gpuPhysMemIsStale;
+	}
+
+	/**
+		@brief Copies our content from another AcceleratorBuffer
+	 */
+	 __attribute__((noinline))
+	void CopyFromNonblocking(
+		vk::raii::CommandBuffer& cmdBuf,
+		const AcceleratorBuffer<T>& rhs,
+		bool reallocateToMatch = true)
+	{
+		//Copy placement hints from the other instance, then resize to match
+		SetCpuAccessHint(rhs.m_cpuAccessHint);
+		SetGpuAccessHint(rhs.m_gpuAccessHint, reallocateToMatch);
+		resize(rhs.m_size);
+
+		//Valid data CPU side? Copy it to here
+		if(rhs.HasCpuBuffer() && !rhs.m_cpuPhysMemIsStale)
+		{
+			//non-trivially-copyable types have to be copied one at a time
+			if(!std::is_trivially_copyable<T>::value)
+			{
+				for(size_t i=0; i<m_size; i++)
+					m_cpuPtr[i] = rhs.m_cpuPtr[i];
+			}
+
+			//Trivially copyable types can be done more efficiently in a block
+			else
+				memcpy(m_cpuPtr, rhs.m_cpuPtr, m_size * sizeof(T));
+		}
+		m_cpuPhysMemIsStale = rhs.m_cpuPhysMemIsStale;
+
+		//Valid data GPU side? Copy it to here
+		if(rhs.HasGpuBuffer() && !rhs.m_gpuPhysMemIsStale)
+		{
+			//Make the transfer request
+			vk::BufferCopy region(0, 0, m_size * sizeof(T));
+			cmdBuf.copyBuffer(**rhs.m_gpuBuffer, **m_gpuBuffer, {region});
 		}
 		m_gpuPhysMemIsStale = rhs.m_gpuPhysMemIsStale;
 	}
@@ -931,6 +983,47 @@ public:
 	}
 
 	/**
+		@brief Prepares the buffer to be accessed from the CPU, but does not copy GPU-side data to the CPU.
+
+		This function can be used instead of PrepareForCpuAccess() for improved performance if you intend to
+		completely overwrite the buffer contents on the CPU, and thus do not need to copy GPU_side data back.
+	 */
+	void PrepareForCpuAccessIgnoringGpuData()
+	{
+		//Early out if no content
+		if(m_size == 0)
+			return;
+
+		//If there's no buffer at all on the CPU, allocate one
+		if(!HasCpuBuffer() && (m_gpuMemoryType != MEM_TYPE_GPU_DMA_CAPABLE))
+			AllocateCpuBuffer(m_capacity);
+
+		m_gpuPhysMemIsStale = true;
+		m_cpuPhysMemIsStale = false;
+	}
+
+	/**
+		@brief Prepares the buffer to be accessed from the CPU, without blocking
+
+		This MUST be called prior to accessing the CPU-side buffer to ensure that m_cpuPtr is valid and up to date.
+
+		Set skipBarrier for transfer-only transactions not following a shader invocation in the same command buffer
+	 */
+	void PrepareForCpuAccessNonblocking(vk::raii::CommandBuffer& cmdBuf, bool skipBarrier = false)
+	{
+		//Early out if no content
+		if(m_size == 0)
+			return;
+
+		//If there's no buffer at all on the CPU, allocate one
+		if(!HasCpuBuffer() && (m_gpuMemoryType != MEM_TYPE_GPU_DMA_CAPABLE))
+			AllocateCpuBuffer(m_capacity);
+
+		if(m_cpuPhysMemIsStale)
+			CopyToCpuNonblocking(cmdBuf, skipBarrier);
+	}
+
+	/**
 		@brief Prepares the buffer to be accessed from the GPU
 
 		This MUST be called prior to accessing the GPU-side buffer to ensure that m_gpuPhysMem is valid and up to date.
@@ -1012,6 +1105,35 @@ protected:
 
 		//Submit the request and block until it completes
 		g_vkTransferQueue->SubmitAndBlock(*g_vkTransferCommandBuffer);
+
+		m_cpuPhysMemIsStale = false;
+	}
+
+	/**
+		@brief Copy the buffer contents from GPU to CPU without blocking on the CPU
+	 */
+	void CopyToCpuNonblocking(vk::raii::CommandBuffer& cmdBuf, bool skipBarrier = false)
+	{
+		assert(std::is_trivially_copyable<T>::value);
+
+		//Add a barrier just in case a shader is still writing to it
+		if(!skipBarrier)
+		{
+			cmdBuf.pipelineBarrier(
+				vk::PipelineStageFlagBits::eComputeShader,
+				vk::PipelineStageFlagBits::eTransfer,
+				{},
+				vk::MemoryBarrier(
+					vk::AccessFlagBits::eShaderWrite,
+					vk::AccessFlagBits::eTransferRead
+					),
+				{},
+				{});
+		}
+
+		//Make the transfer request
+		vk::BufferCopy region(0, 0, m_size * sizeof(T));
+		cmdBuf.copyBuffer(**m_gpuBuffer, **m_cpuBuffer, {region});
 
 		m_cpuPhysMemIsStale = false;
 	}

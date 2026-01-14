@@ -89,6 +89,7 @@ set(SCOPEHAL_SOURCES
 	TouchstoneParser.cpp
 
 	FlowGraphNode.cpp
+	SinkNode.cpp
 	Trigger.cpp
 	CDRTrigger.cpp
 	CDR8B10BTrigger.cpp
@@ -170,6 +171,7 @@ set(SCOPEHAL_SOURCES
 	KeysightDCA.cpp
 	LeCroyOscilloscope.cpp
 	LeCroyFWPOscilloscope.cpp
+	MagnovaOscilloscope.cpp
 	MockOscilloscope.cpp
 	MultiLaneBERT.cpp
 	NanoVNA.cpp

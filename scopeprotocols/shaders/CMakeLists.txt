@@ -33,6 +33,9 @@ add_compute_shaders(
 		ACRMS.glsl
 		ACRMS_Trend.glsl
 		BlackmanHarrisWindow.glsl
+		ClockRecoveryPLL_FirstPass.glsl
+		ClockRecoveryPLL_SecondPass.glsl
+		ClockRecoveryPLL_FinalPass.glsl
 		ComplexBlackmanHarrisWindow.glsl
 		ComplexCosineSumWindow.glsl
 		ComplexRectangularWindow.glsl
@@ -40,13 +43,24 @@ add_compute_shaders(
 		ComplexToLogMagnitude.glsl
 		ComplexToMagnitude.glsl
 		CosineSumWindow.glsl
+		DDJMeasurement.glsl
 		DeEmbedOutOfPlace.glsl
 		DeEmbedNormalization.glsl
+		Ethernet100BaseTX_4b5bDecode.glsl
+		Ethernet100BaseTX_Descrambler.glsl
+		Ethernet100BaseTX_FindSSD.glsl
+		Ethernet100BaseTX_MLT3Decoder.glsl
+		Ethernet100BaseTX_TrySync.glsl
+		EyePattern.glsl
+		EyePattern_IndexSearch.glsl
+		FillSquarewaveAndDurations.glsl
 		FIRFilter.glsl
 		SpectrogramPostprocess.glsl
 		SubtractFilter.glsl
 		SubtractInPlace.glsl
 		SubtractOutOfPlace.glsl
+		TIEMeasurement_FirstPass.glsl
+		TIEMeasurement_SecondPass.glsl
 		Threshold.glsl
 		UpsampleFilter.glsl
 		WaterfallFilter.glsl

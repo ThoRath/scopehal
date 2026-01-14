@@ -67,7 +67,10 @@ ThunderScopeOscilloscope::ThunderScopeOscilloscope(SCPITransport* transport)
 	, m_diag_totalWFMs(FilterParameter::TYPE_INT, Unit(Unit::UNIT_COUNTS))
 	, m_diag_droppedWFMs(FilterParameter::TYPE_INT, Unit(Unit::UNIT_COUNTS))
 	, m_diag_droppedPercent(FilterParameter::TYPE_FLOAT, Unit(Unit::UNIT_PERCENT))
+	, m_nextWaveformWriteBuffer(0)
 	, m_adcMode(MODE_8BIT)
+	, m_lastSeq(0)
+	, m_dropUntilSeq(0)
 {
 	m_analogChannelCount = 4;
 
@@ -102,6 +105,10 @@ ThunderScopeOscilloscope::ThunderScopeOscilloscope(SCPITransport* transport)
 	if(!csock)
 		LogFatal("ThunderScopeOscilloscope expects a SCPITwinLanTransport\n");
 
+	//Request entry to credit-based flow control mode rather than lock-step mode
+	const uint8_t r = 'C';
+	m_transport->SendRawData(1, &r);
+
 	//set initial bandwidth on all channels to full
 	m_bandwidthLimits.resize(4);
 	for(size_t i=0; i<4; i++)
@@ -133,8 +140,8 @@ ThunderScopeOscilloscope::ThunderScopeOscilloscope(SCPITransport* transport)
 
 	ResetPerCaptureDiagnostics();
 
-	//Initialize waveform buffers
-	for(size_t i=0; i<m_analogChannelCount; i++)
+	//Initialize waveform buffers. Allocate one extra so we can overlap download and conversion
+	for(size_t i=0; i<m_analogChannelCount + 1; i++)
 	{
 		m_analogRawWaveformBuffers.push_back(std::make_unique<AcceleratorBuffer<int16_t> >());
 		m_analogRawWaveformBuffers[i]->SetCpuAccessHint(AcceleratorBuffer<int16_t>::HINT_LIKELY);
@@ -317,17 +324,56 @@ OscilloscopeChannel* ThunderScopeOscilloscope::GetExternalTrigger()
 	return NULL;
 }
 
+void ThunderScopeOscilloscope::BackgroundProcessing()
+{
+	//Call the base class to flush the transport etc
+	RemoteBridgeOscilloscope::BackgroundProcessing();
+
+	//Push any previously acquired waveforms to the RX buffer if we have them
+	lock_guard<recursive_mutex> wipLock(m_wipWaveformMutex);
+	PushPendingWaveformsIfReady();
+}
+
 Oscilloscope::TriggerMode ThunderScopeOscilloscope::PollTrigger()
 {
-	//Always report "triggered" so we can block on AcquireData() in ScopeThread
-	//TODO: peek function of some sort?
-	return TRIGGER_MODE_TRIGGERED;
+	//Is the trigger armed? If not, report stopped
+	if(!IsTriggerArmed())
+		return TRIGGER_MODE_STOP;
+
+	//See if we have data ready
+	if(dynamic_cast<SCPITwinLanTransport*>(m_transport)->GetSecondarySocket().GetRxBytesAvailable() > 0)
+	{
+		#ifdef HAVE_NVTX
+			nvtxMark("PollTrigger");
+		#endif
+
+		//Do we have old stale waveforms to drop still in the socket buffer? Throw it out
+		if(m_dropUntilSeq > m_lastSeq)
+		{
+			LogTrace("Dropping until sequence %u, last received sequence was %u. Need to drop this waveform\n",
+				(unsigned int)m_dropUntilSeq, (unsigned int)m_lastSeq);
+			DoAcquireData(false);
+			return TRIGGER_MODE_RUN;
+		}
+
+		//No, this is a fresh waveform - prepare to download it
+		return TRIGGER_MODE_TRIGGERED;
+	}
+
+	else
+		return TRIGGER_MODE_RUN;
 }
 
 bool ThunderScopeOscilloscope::AcquireData()
 {
-	const uint8_t r = 'S';
-	m_transport->SendRawData(1, &r);
+	return DoAcquireData(true);
+}
+
+bool ThunderScopeOscilloscope::DoAcquireData(bool keep)
+{
+	#ifdef HAVE_NVTX
+		nvtx3::scoped_range range("ThunderScopeOscilloscope::DoAcquireData");
+	#endif
 
 	//Read Version No.
 	uint8_t version;
@@ -335,9 +381,18 @@ bool ThunderScopeOscilloscope::AcquireData()
 		return false;
 
 	//Read the sequence number of the current waveform
-	uint32_t seqnum;
-	if(!m_transport->ReadRawData(sizeof(seqnum), (uint8_t*)&seqnum))
+	if(!m_transport->ReadRawData(sizeof(m_lastSeq), (uint8_t*)&m_lastSeq))
 		return false;
+
+	//Acknowledge receipt of this waveform
+	m_transport->SendRawData(4, (uint8_t*)&m_lastSeq);
+
+	if(!keep)
+		LogTrace("Dropping waveform %u\n",m_lastSeq);
+	else
+	{
+		//LogTrace("Keeping waveform %u\n",m_lastSeq);
+	}
 
 	//Read the number of channels in the current waveform
 	uint16_t numChannels;
@@ -369,22 +424,26 @@ bool ThunderScopeOscilloscope::AcquireData()
 	if(!m_transport->ReadRawData(sizeof(wfms_s), (uint8_t*)&wfms_s))
 		return false;
 
-	m_diag_hardwareWFMHz.SetFloatVal(wfms_s);
+	if(keep)
+		m_diag_hardwareWFMHz.SetFloatVal(wfms_s);
 
 	//Acquire data for each channel
 	uint8_t chnum;
 	uint8_t dataType;
 	uint64_t memdepth;
 	float config[3];
-	SequenceSet s;
 	double t = GetTime();
 	int64_t fs = (t - floor(t)) * FS_PER_SECOND;
+
+	lock_guard<recursive_mutex> wipLock(m_wipWaveformMutex);
 
 	//Analog channels get processed separately
 	vector<UniformAnalogWaveform*> awfms;
 	vector<size_t> achans;
 	vector<float> scales;
 	vector<float> offsets;
+
+	bool processedWaveformsOnGPU = true;
 
 	for(size_t i=0; i<numChannels; i++)
 	{
@@ -394,10 +453,16 @@ bool ThunderScopeOscilloscope::AcquireData()
 		if(!m_transport->ReadRawData(sizeof(memdepth), (uint8_t*)&memdepth))
 			return false;
 
-		auto& abuf = m_analogRawWaveformBuffers[chnum];
+		//Grab the next free buffer
+		auto& abuf = m_analogRawWaveformBuffers[m_nextWaveformWriteBuffer];
+		m_nextWaveformWriteBuffer = (m_nextWaveformWriteBuffer + 1) % m_analogRawWaveformBuffers.size();
 		abuf->resize(memdepth);
 		abuf->PrepareForCpuAccess();
 		achans.push_back(chnum);
+
+		#ifdef HAVE_NVTX
+			nvtx3::scoped_range range2(string("Channel ") + to_string(chnum));
+		#endif
 
 		//Analog channels
 		if(chnum < m_analogChannelCount)
@@ -407,9 +472,9 @@ bool ThunderScopeOscilloscope::AcquireData()
 			//Scale and offset are sent in the header since they might have changed since the capture began
 			if(!m_transport->ReadRawData(sizeof(config), (uint8_t*)&config))
 				return false;
+
 			float scale = config[0];
 			float offset = config[1];
-			//float trigphase = -config[2] * fs_per_sample;
 			float trigphase = config[2];
 			scale *= GetChannelAttenuation(chnum);
 			offset *= GetChannelAttenuation(chnum);
@@ -429,8 +494,12 @@ bool ThunderScopeOscilloscope::AcquireData()
 				return false;
 			abuf->MarkModifiedFromCpu();
 
+			//If discarding data, stop processing at this point
+			if(!keep)
+				continue;
+
 			//Create our waveform
-			UniformAnalogWaveform* cap = AllocateAnalogWaveform(m_nickname + "." + GetChannel(i)->GetHwname());
+			auto cap = AllocateAnalogWaveform(m_nickname + "." + GetChannel(i)->GetHwname());
 			cap->m_timescale = fs_per_sample;
 			cap->m_triggerPhase = trigphase;
 			cap->m_startTimestamp = t;
@@ -443,7 +512,68 @@ bool ThunderScopeOscilloscope::AcquireData()
 			scales.push_back(scale);
 			offsets.push_back(offset);
 
-			s[GetOscilloscopeChannel(chnum)] = cap;
+			//Clear out any previously pending waveforms before we queue up this one
+			if(i == 0)
+				PushPendingWaveformsIfReady();
+
+			m_wipWaveforms[GetOscilloscopeChannel(chnum)] = cap;
+
+			//Kick off the GPU-side processing of the waveform to run nonblocking while we download the next
+			//Wait for any previous waveform processing to finish first, since we're reusing the command buffer
+			if(!keep)
+			{}
+			else if(g_hasShaderInt8 && g_hasPushDescriptor && (dataType == DATATYPE_I8))
+			{
+				m_queue->WaitIdle();
+				m_cmdBuf->begin({});
+
+				m_conversion8BitPipeline->Bind(*m_cmdBuf);
+				m_conversion8BitPipeline->BindBufferNonblocking(0, cap->m_samples, *m_cmdBuf, true);
+				m_conversion8BitPipeline->BindBufferNonblocking(1, *abuf, *m_cmdBuf);
+
+				ConvertRawSamplesShaderArgs args;
+				args.size = cap->size();
+				args.gain = scales[i];
+				args.offset = -offsets[i];
+
+				const uint32_t compute_block_count = GetComputeBlockCount(cap->size(), 64);
+				m_conversion8BitPipeline->DispatchNoRebind(
+					*m_cmdBuf, args,
+					min(compute_block_count, 32768u),
+					compute_block_count / 32768 + 1);
+
+				cap->MarkModifiedFromGpu();
+				m_cmdBuf->end();
+				m_queue->Submit(*m_cmdBuf);
+			}
+			else if(g_hasShaderInt16 && g_hasPushDescriptor && (dataType == DATATYPE_I16))
+			{
+				m_queue->WaitIdle();
+				m_cmdBuf->begin({});
+
+				m_conversion16BitPipeline->Bind(*m_cmdBuf);
+				m_conversion16BitPipeline->BindBufferNonblocking(0, cap->m_samples, *m_cmdBuf, true);
+				m_conversion16BitPipeline->BindBufferNonblocking(1, *abuf, *m_cmdBuf);
+
+				ConvertRawSamplesShaderArgs args;
+				args.size = cap->size();
+				args.gain = scales[i];
+				args.offset = -offsets[i];
+
+				const uint32_t compute_block_count = GetComputeBlockCount(cap->size(), 64);
+				m_conversion16BitPipeline->DispatchNoRebind(
+					*m_cmdBuf, args,
+					min(compute_block_count, 32768u),
+					compute_block_count / 32768 + 1);
+
+				cap->MarkModifiedFromGpu();
+				m_cmdBuf->end();
+				m_queue->Submit(*m_cmdBuf);
+			}
+
+			//Not available, fall back to CPU side processing
+			else
+				processedWaveformsOnGPU = false;
 		}
 		else
 		{
@@ -451,70 +581,11 @@ bool ThunderScopeOscilloscope::AcquireData()
 		}
 	}
 
-	//Prefer GPU path
-	if(g_hasShaderInt8 && g_hasPushDescriptor && (dataType == DATATYPE_I8))
-	{
-		m_cmdBuf->begin({});
-
-		m_conversion8BitPipeline->Bind(*m_cmdBuf);
-
-		for(size_t i=0; i<awfms.size(); i++)
-		{
-			auto cap = awfms[i];
-
-			m_conversion8BitPipeline->BindBufferNonblocking(0, cap->m_samples, *m_cmdBuf, true);
-			m_conversion8BitPipeline->BindBufferNonblocking(1, *m_analogRawWaveformBuffers[achans[i]], *m_cmdBuf);
-
-			ConvertRawSamplesShaderArgs args;
-			args.size = cap->size();
-			args.gain = scales[i];
-			args.offset = -offsets[i];
-
-			const uint32_t compute_block_count = GetComputeBlockCount(cap->size(), 64);
-			m_conversion8BitPipeline->DispatchNoRebind(
-				*m_cmdBuf, args,
-				min(compute_block_count, 32768u),
-				compute_block_count / 32768 + 1);
-
-			cap->MarkModifiedFromGpu();
-		}
-
-		m_cmdBuf->end();
-		m_queue->SubmitAndBlock(*m_cmdBuf);
-	}
-	else if(g_hasShaderInt16 && g_hasPushDescriptor && (dataType == DATATYPE_I16))
-	{
-		m_cmdBuf->begin({});
-
-		m_conversion16BitPipeline->Bind(*m_cmdBuf);
-
-		for(size_t i=0; i<awfms.size(); i++)
-		{
-			auto cap = awfms[i];
-
-			m_conversion16BitPipeline->BindBufferNonblocking(0, cap->m_samples, *m_cmdBuf, true);
-			m_conversion16BitPipeline->BindBufferNonblocking(1, *m_analogRawWaveformBuffers[achans[i]], *m_cmdBuf);
-
-			ConvertRawSamplesShaderArgs args;
-			args.size = cap->size();
-			args.gain = scales[i];
-			args.offset = -offsets[i];
-
-			const uint32_t compute_block_count = GetComputeBlockCount(cap->size(), 64);
-			m_conversion16BitPipeline->DispatchNoRebind(
-				*m_cmdBuf, args,
-				min(compute_block_count, 32768u),
-				compute_block_count / 32768 + 1);
-
-			cap->MarkModifiedFromGpu();
-		}
-
-		m_cmdBuf->end();
-		m_queue->SubmitAndBlock(*m_cmdBuf);
-	}
+	if(!keep)
+		return true;
 
 	//Fallback path if GPU doesn't have suitable integer support
-	else
+	if(!processedWaveformsOnGPU)
 	{
 		//Process analog captures in parallel
 		#pragma omp parallel for
@@ -542,36 +613,10 @@ bool ThunderScopeOscilloscope::AcquireData()
 			}
 			cap->MarkModifiedFromCpu();
 		}
+
+		//If we did CPU side conversion, push the waveforms to our queue now
+		PushPendingWaveformsIfReady();
 	}
-
-	FilterParameter* param = &m_diag_totalWFMs;
-	int total = param->GetIntVal() + 1;
-	param->SetIntVal(total);
-
-	param = &m_diag_droppedWFMs;
-	int dropped = param->GetIntVal();
-
-	//Save the waveforms to our queue
-	m_pendingWaveformsMutex.lock();
-	m_pendingWaveforms.push_back(s);
-
-	//If we get backed up, drop the extra waveforms
-	while (m_pendingWaveforms.size() > 2)
-	{
-		SequenceSet set = *m_pendingWaveforms.begin();
-		for(auto it : set)
-			AddWaveformToAnalogPool(it.second);
-		m_pendingWaveforms.pop_front();
-
-		dropped++;
-	}
-
-	m_pendingWaveformsMutex.unlock();
-
-	param->SetIntVal(dropped);
-
-	param = &m_diag_droppedPercent;
-	param->SetFloatVal((float)dropped / (float)total);
 
 	m_receiveClock.Tick();
 	m_diag_receivedWFMHz.SetFloatVal(m_receiveClock.GetAverageHz());
@@ -581,6 +626,56 @@ bool ThunderScopeOscilloscope::AcquireData()
 		m_triggerArmed = false;
 
 	return true;
+}
+
+/**
+	@brief Wait for waveform conversion to finish, then push it to the pending waveforms buffer
+ */
+void ThunderScopeOscilloscope::PushPendingWaveformsIfReady()
+{
+	if(m_wipWaveforms.empty())
+		return;
+
+	//Wait up to 1ms for GPU side conversion to finish and return if it's not done
+	if(!m_queue->WaitIdleWithTimeout(1000 * 1000))
+		return;
+
+	//Save the waveforms to our queue
+	m_pendingWaveformsMutex.lock();
+	m_pendingWaveforms.push_back(m_wipWaveforms);
+
+	//Bump waveform performance counters
+	FilterParameter* param = &m_diag_totalWFMs;
+	int total = param->GetIntVal() + 1;
+	param->SetIntVal(total);
+
+	//If we got backed up, drop the extra waveforms
+	param = &m_diag_droppedWFMs;
+	int dropped = param->GetIntVal();
+	while (m_pendingWaveforms.size() > 2)
+	{
+		LogTrace("Dropping waveform due to excessive pend queue depth\n");
+
+		SequenceSet set = *m_pendingWaveforms.begin();
+		for(auto it : set)
+			AddWaveformToAnalogPool(it.second);
+		m_pendingWaveforms.pop_front();
+
+		dropped++;
+	}
+
+	//Update dropped waveform perf counter
+	param->SetIntVal(dropped);
+	param = &m_diag_droppedPercent;
+	param->SetFloatVal((float)dropped / (float)total);
+
+	m_pendingWaveformsMutex.unlock();
+
+	m_wipWaveforms.clear();
+
+	#ifdef HAVE_NVTX
+		nvtxMark("Pushed waveforms");
+	#endif
 }
 
 void ThunderScopeOscilloscope::Start()
@@ -594,6 +689,23 @@ void ThunderScopeOscilloscope::Start()
 	m_triggerOneShot = false;
 
 	ResetPerCaptureDiagnostics();
+}
+
+void ThunderScopeOscilloscope::Stop()
+{
+	RemoteBridgeOscilloscope::Stop();
+
+	//Wait for any previous in-progress waveforms to finish processing
+	{
+		lock_guard<recursive_mutex> wipLock(m_wipWaveformMutex);
+		while(!m_wipWaveforms.empty())
+			PushPendingWaveformsIfReady();
+	}
+
+	//Ask the server what the last waveform it sent was
+	m_dropUntilSeq = stoul(Trim(m_transport->SendCommandQueuedWithReply("SEQNUM?")));
+	LogTrace("Trigger stopped after processing waveform %u. Last sequence number sent by scope was %u. Need to drop %u stale waveforms already in flight\n",
+		(unsigned int)m_lastSeq, (unsigned int)m_dropUntilSeq, (unsigned int)(m_dropUntilSeq - m_lastSeq));
 }
 
 void ThunderScopeOscilloscope::StartSingleTrigger()

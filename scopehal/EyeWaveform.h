@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -41,6 +41,14 @@
 
 #define EYE_ACCUM_SCALE 64
 
+class EyeNormalizeConstants
+{
+public:
+	uint32_t	width;
+	uint32_t	height;
+	float		satLevel;
+};
+
 /**
 	@brief An eye-pattern waveform
 	@ingroup datamodel
@@ -72,9 +80,19 @@ public:
 
 	///@brief Returns a pointer to the raw (not normalized) accumulator data
 	int64_t* GetAccumData()
+	{ return m_accumdata.GetCpuPointer(); }
+
+	AcceleratorBuffer<int64_t>& GetAccumBuffer()
 	{ return m_accumdata; }
 
 	void Normalize();
+	void Normalize(
+		vk::raii::CommandBuffer& cmdBuf,
+		std::shared_ptr<QueueHandle> queue,
+		std::shared_ptr<ComputePipeline> normalizeReducePipe,
+		std::shared_ptr<ComputePipeline> normalizeScalePipe,
+		AcceleratorBuffer<int64_t>& nmaxBuf
+		);
 
 	///@brief Get the total number of UIs integrated in this eye
 	size_t GetTotalUIs()
@@ -145,16 +163,62 @@ public:
 	EyeType GetType()
 	{ return m_type; }
 
+	/**
+		@brief Number of modulation levels (2 = NRZ, 3 = MLT3/PAM3, 4 = PAM4, etc)
+	 */
+	size_t m_numLevels;
+
+	/**
+		@brief Midpoint levels for each eye opening
+	 */
+	std::vector<int> m_midpoints;
+
 	virtual void FreeGpuMemory() override
-	{}
+	{ m_accumdata.FreeGpuBuffer(); }
 
 	virtual bool HasGpuBuffer() override
-	{ return false; }
+	{ return m_accumdata.HasGpuBuffer(); }
+
+	virtual void PrepareForCpuAccess() override
+	{
+		m_outdata.PrepareForCpuAccess();
+		m_accumdata.PrepareForCpuAccess();
+	}
+
+	virtual void PrepareForGpuAccess() override
+	{
+		m_outdata.PrepareForGpuAccess();
+		m_accumdata.PrepareForGpuAccess();
+	}
+
+	virtual void MarkSamplesModifiedFromCpu() override
+	{
+		m_outdata.MarkModifiedFromCpu();
+		m_accumdata.MarkModifiedFromCpu();
+	}
+
+	virtual void MarkSamplesModifiedFromGpu() override
+	{
+		m_outdata.MarkModifiedFromGpu();
+		m_accumdata.MarkModifiedFromGpu();
+	}
+
+	virtual void MarkModifiedFromCpu() override
+	{
+		m_outdata.MarkModifiedFromCpu();
+		m_accumdata.MarkModifiedFromCpu();
+	}
+
+	virtual void MarkModifiedFromGpu() override
+	{
+		m_outdata.MarkModifiedFromGpu();
+		m_accumdata.MarkModifiedFromGpu();
+	}
 
 protected:
 
 	///@brief Accumulator buffer
-	int64_t* m_accumdata;
+	AcceleratorBuffer<int64_t> m_accumdata;
 
 	///@brief Total UIs integrated
 	size_t m_totalUIs;

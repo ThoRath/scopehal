@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopeprotocols                                                                                                    *
 *                                                                                                                      *
-* Copyright (c) 2012-2024 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -110,7 +110,7 @@ void SParameterFilter::RefreshPorts()
 	//Delete extra inputs
 	size_t nin = nports*nports*2;
 	for(size_t i=nin; i<m_inputs.size(); i++)
-		SetInput(i, NULL, true);
+		SetInput(i, nullptr, true);
 	m_inputs.resize(nin);
 	m_signalNames.resize(nin);
 

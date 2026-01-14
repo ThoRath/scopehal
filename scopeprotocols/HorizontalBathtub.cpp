@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopeprotocols                                                                                                    *
 *                                                                                                                      *
-* Copyright (c) 2012-2023 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -71,20 +71,33 @@ string HorizontalBathtub::GetProtocolName()
 	return "Horz Bathtub";
 }
 
+Filter::DataLocation HorizontalBathtub::GetInputLocation()
+{
+	//We explicitly manage our input memory and don't care where it is when Refresh() is called
+	return LOC_DONTCARE;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Actual decoder logic
 
-void HorizontalBathtub::Refresh()
+void HorizontalBathtub::Refresh(vk::raii::CommandBuffer& cmdBuf, shared_ptr<QueueHandle> queue)
 {
+	#ifdef HAVE_NVTX
+		nvtx3::scoped_range range("HorizontalBathtub::Refresh");
+	#endif
+
 	if(!VerifyAllInputsOK(true))
 	{
-		SetData(NULL, 0);
+		SetData(nullptr, 0);
 		return;
 	}
 
 	//Get the input data
 	auto din = dynamic_cast<EyeWaveform*>(GetInputWaveform(0));
-	din->PrepareForCpuAccess();
+	cmdBuf.begin({});
+	din->GetAccumBuffer().PrepareForCpuAccessNonblocking(cmdBuf);
+	cmdBuf.end();
+	queue->SubmitAndBlock(cmdBuf);
 	float threshold = m_parameters[m_voltageName].GetFloatVal();
 
 	//Find the eye bin for this height
@@ -107,19 +120,62 @@ void HorizontalBathtub::Refresh()
 	cap->m_triggerPhase = -din->m_uiWidth/2;
 	cap->m_timescale = fs_per_pixel;
 
+	//Get the eye opening we're targeting
+	//TODO: PAM4 support
+	int eyemid = 0;
+	switch(din->m_numLevels)
+	{
+		case 2:
+			eyemid = din->m_midpoints[0];
+			break;
+
+		case 3:
+			if(ybin > ymid)
+				eyemid = din->m_midpoints[1];
+			else
+				eyemid = din->m_midpoints[0];
+			break;
+
+		default:
+			break;
+	}
+
 	//Extract the single scanline we're interested in
-	//TODO: support non-NRZ waveforms
 	size_t len = din->GetWidth();
 	auto halflen = len/2;
 	auto quartlen = halflen/2;
 	cap->Resize(halflen);
 	for(size_t i=0; i<halflen; i++)
 	{
-		auto ber = din->GetBERAtPoint(i + quartlen, ybin, din->GetWidth()/2, din->GetHeight()/2);
+		auto ber = din->GetBERAtPoint(i + quartlen, ybin, din->GetWidth()/2, eyemid);
 		if(ber < 1e-20)
 			cap->m_samples[i] = -20;
 		else
 			cap->m_samples[i] = log10(ber);
+	}
+
+	//Avoid spikes: if a point has high BER then everything outside it must too
+	//TODO: is this better to fix in GetBERAtPoint?
+	float vmax = cap->m_samples[quartlen];
+	for(size_t i=quartlen+1; i<halflen; i++)
+	{
+		//Find the highest value we've seen so far
+		vmax = max(cap->m_samples[i], vmax);
+
+		//and make sure this sample is no less than that
+		cap->m_samples[i] = vmax;
+	}
+	vmax = cap->m_samples[quartlen];
+	for(size_t i=quartlen; ; i--)
+	{
+		//Find the highest value we've seen so far
+		vmax = max(cap->m_samples[i], vmax);
+
+		//and make sure this sample is no less than that
+		cap->m_samples[i] = vmax;
+
+		if(i == 0)
+			break;
 	}
 
 	//TODO: dual dirac extrapolation

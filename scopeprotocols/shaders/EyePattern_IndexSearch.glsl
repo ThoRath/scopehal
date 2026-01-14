@@ -1,8 +1,8 @@
 /***********************************************************************************************************************
 *                                                                                                                      *
-* libscopeexports                                                                                                    *
+* libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2022 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -27,101 +27,82 @@
 *                                                                                                                      *
 ***********************************************************************************************************************/
 
-/**
-	@file
-	@author Andrew D. Zonenberg
-	@brief Declaration of CSVExportWizard
- */
+#version 430
+#pragma shader_stage(compute)
+#extension GL_ARB_gpu_shader_int64 : require
 
-#ifndef CSVExportWizard_h
-#define CSVExportWizard_h
-
-/**
-	@brief Select reference channel
- */
-class CSVExportReferenceChannelSelectionPage
+layout(std430, binding=0) restrict readonly buffer buf_din
 {
-public:
-	CSVExportReferenceChannelSelectionPage(const std::vector<OscilloscopeChannel*>& channels);
-
-	Gtk::Grid m_grid;
-		Gtk::Label m_captionLabel;
-		Gtk::Label m_referenceLabel;
-		Gtk::ComboBoxText m_referenceBox;
-
-	StreamDescriptor GetActiveChannel() const
-	{ return m_streams[m_referenceBox.get_active_row_number()]; }
-
-	const std::vector<StreamDescriptor>& GetStreams() const
-	{ return m_streams; }
-
-protected:
-	std::vector<StreamDescriptor> m_streams;
+	int64_t din[];
 };
 
-/**
-	@brief Select other channels
- */
-class CSVExportOtherChannelSelectionPage
+layout(std430, binding=1) restrict writeonly buffer buf_results
 {
-public:
-	CSVExportOtherChannelSelectionPage(const CSVExportReferenceChannelSelectionPage& ref);
-
-	Gtk::Grid m_grid;
-		Gtk::Frame m_selectedFrame;
-			Gtk::ListViewText m_selectedChannels;
-		Gtk::Frame m_availableFrame;
-			Gtk::ListViewText m_availableChannels;
-
-		Gtk::Button m_removeButton;
-		Gtk::Button m_addButton;
-
-	void UpdateChannelList();
-
-	std::map<std::string, StreamDescriptor> m_targets;
-
-protected:
-	const CSVExportReferenceChannelSelectionPage& m_ref;
-
-	void OnAddChannel();
-	void OnRemoveChannel();
+	uint results[];
 };
 
-/**
-	@brief Final configuration and output path
- */
-class CSVExportFinalPage
+layout(std430, push_constant) uniform constants
 {
-public:
-	CSVExportFinalPage();
-	virtual ~CSVExportFinalPage();
-
-	Gtk::Grid m_grid;
-		Gtk::FileChooserWidget m_chooser;
-
-protected:
+	int64_t	timescale;
+	int64_t	triggerPhase;
+	uint	len;
+	uint	numSamplesPerThread;
 };
 
-/**
-	@brief CSV exporter
- */
-class CSVExportWizard : public ExportWizard
+layout(local_size_x=64, local_size_y=1, local_size_z=1) in;
+
+void main()
 {
-public:
-	CSVExportWizard(const std::vector<OscilloscopeChannel*>& channels);
-	virtual ~CSVExportWizard();
+	//Get timestamp of the first sample in this thread's block
+	int64_t target = int64_t(gl_GlobalInvocationID.x * numSamplesPerThread) * timescale + triggerPhase;
 
-	static std::string GetExportName();
+	//Binary search for the first clock edge after this sample
+	uint pos = len/2;
+	uint last_lo = 0;
+	uint last_hi = len-1;
+	uint iclk = 0;
+	if(len > 0)
+	{
+		//Clip if out of range
+		if(din[0] >= target)
+			iclk = 0;
+		else if(din[last_hi] < target)
+			iclk = len-1;
 
-	EXPORT_WIZARD_INITPROC(CSVExportWizard)
+		//Main loop
+		else
+		{
+			while(true)
+			{
+				//Stop if we've bracketed the target
+				if( (last_hi - last_lo) <= 1)
+				{
+					iclk = last_lo;
+					break;
+				}
 
-protected:
-	virtual void on_prepare(Gtk::Widget* page);
-	virtual void on_apply();
+				//Move down
+				if(din[pos] > target)
+				{
+					uint delta = pos - last_lo;
+					last_hi = pos;
+					pos = last_lo + delta/2;
+				}
 
-	CSVExportReferenceChannelSelectionPage m_referenceSelectionPage;
-	CSVExportOtherChannelSelectionPage m_otherChannelSelectionPage;
-	CSVExportFinalPage m_finalPage;
-};
+				//Move up
+				else
+				{
+					uint delta = last_hi - pos;
+					last_lo = pos;
+					pos = last_hi - delta/2;
+				}
+			}
+		}
+	}
 
-#endif
+	//We actually want the clock edge before this one, so decrement it
+	if(iclk > 0)
+		iclk --;
+
+	results[gl_GlobalInvocationID.x] = iclk;
+}

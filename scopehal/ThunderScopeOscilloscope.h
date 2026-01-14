@@ -2,7 +2,7 @@
 *                                                                                                                      *
 * libscopehal                                                                                                          *
 *                                                                                                                      *
-* Copyright (c) 2012-2025 Andrew D. Zonenberg and contributors                                                         *
+* Copyright (c) 2012-2026 Andrew D. Zonenberg and contributors                                                         *
 * All rights reserved.                                                                                                 *
 *                                                                                                                      *
 * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the     *
@@ -75,6 +75,7 @@ public:
 	virtual void EnableChannel(size_t i) override;
 
 	//Triggering
+	virtual void BackgroundProcessing() override;
 	virtual Oscilloscope::TriggerMode PollTrigger() override;
 	virtual bool AcquireData() override;
 	virtual void PushEdgeTrigger(EdgeTrigger* trig) override;
@@ -82,6 +83,7 @@ public:
 	// Captures
 	virtual void Start() override;
 	virtual void StartSingleTrigger() override;
+	virtual void Stop() override;
 	virtual void ForceTrigger() override;
 
 	//Timebase
@@ -106,6 +108,9 @@ public:
 protected:
 	void ResetPerCaptureDiagnostics();
 	void RefreshSampleRate();
+	bool DoAcquireData(bool keep);
+
+	void PushPendingWaveformsIfReady();
 
 	std::string GetChannelColor(size_t i);
 
@@ -136,6 +141,9 @@ protected:
 	///@brief Buffers for storing raw ADC samples before converting to fp32
 	std::vector<std::unique_ptr<AcceleratorBuffer<int16_t> > > m_analogRawWaveformBuffers;
 
+	///@brief Index of next buffer from m_analogRawWaveformBuffers to use
+	unsigned int m_nextWaveformWriteBuffer;
+
 	///@brief Vulkan queue used for sample conversion
 	std::shared_ptr<QueueHandle> m_queue;
 
@@ -163,6 +171,18 @@ protected:
 		MODE_8BIT,
 		MODE_12BIT
 	} m_adcMode;
+
+	///@brief Most recently received sequence number
+	uint32_t m_lastSeq;
+
+	///@brief Sequence number to drop until (if we get stale data after stopping the trigger)
+	uint32_t m_dropUntilSeq;
+
+	///@brief Mutex for m_wipWaveforms
+	std::recursive_mutex m_wipWaveformMutex;
+
+	///@brief Waveforms actively being downloaded and processed but not ready to push to the filter graph yet
+	SequenceSet m_wipWaveforms;
 
 public:
 

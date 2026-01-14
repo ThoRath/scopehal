@@ -34,8 +34,12 @@ add_compute_shaders(
 		Convert16BitSamples.glsl
 		DeEmbedFilter.glsl
 		DegradeSerialData.glsl
+		EyeNormalizeReduce.glsl
+		EyeNormalizeScale.glsl
 		FindZeroCrossings.glsl
 		Gather.glsl
+		Histogram.glsl
+		MinMax.glsl
 		NoisySine.glsl
 		NoisySineSum.glsl
 		PreGather.glsl
